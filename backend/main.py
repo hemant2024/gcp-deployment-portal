@@ -1,90 +1,146 @@
 """
-GCP Deployment Portal — FastAPI Backend
+Main FastAPI application for GCP Deployment Portal
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import logging
 from contextlib import asynccontextmanager
-import asyncio
-import structlog
-import os
-from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 
-load_dotenv()
+from config import get_settings
+from database import init_db
+from routers import auth, deployments, catalog
 
-logger = structlog.get_logger()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+settings = get_settings()
+
+
+# ==================== Lifespan ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    logger.info("startup", service="gcp-portal-api", version="1.0.0-local")
+    """Application lifespan - startup and shutdown"""
+    # Startup
+    logger.info("Initializing database...")
+    init_db()
+    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+
     yield
-    logger.info("shutdown", service="gcp-portal-api")
+
+    # Shutdown
+    logger.info(f"Shutting down {settings.APP_NAME}")
+
+
+# ==================== App Creation ====================
 
 app = FastAPI(
-    title="GCP Deployment Portal API",
-    description="Enterprise-grade GCP workload deployment platform",
-    version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-    lifespan=lifespan
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="Enterprise GCP Deployment Portal with AI-powered approval workflows",
+    lifespan=lifespan,
 )
 
-# CORS Middleware
-origins = os.getenv("CORS_ORIGINS", '["http://localhost:3000"]')
-import json
+# ==================== Middleware ====================
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=json.loads(origins),
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Health Check
-@app.get("/health")
-async def health_check():
+# Trusted Host
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+
+# ==================== Exception Handlers ====================
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request, exc):
+    """Handle ValueError"""
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    """Handle general exceptions"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
+# ==================== Routes ====================
+
+@app.get("/", tags=["info"])
+async def root():
+    """Root endpoint"""
     return {
-        "status": "healthy",
-        "version": "1.0.0-local",
-        "service": "gcp-deployment-portal",
-        "environment": os.getenv("APP_ENV", "development")
+        "name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "running",
     }
 
-# WebSocket connection manager
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+@app.get("/health", tags=["info"])
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": settings.APP_NAME,
+    }
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
 
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(message)
-            except Exception:
-                pass
+@app.get("/api/docs", tags=["info"])
+async def api_docs():
+    """API documentation"""
+    return {
+        "message": "Go to /docs for interactive API documentation",
+        "openapi_url": "/openapi.json",
+    }
 
-manager = ConnectionManager()
 
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await manager.broadcast(f"Client {client_id}: {data}")
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+# ==================== Include Routers ====================
 
-# Root redirect
-@app.get("/")
-async def root():
-    return {"message": "GCP Deployment Portal API", "docs": "/api/docs"}
+app.include_router(auth.router)
+app.include_router(deployments.router)
+app.include_router(catalog.router)
 
+
+# ==================== Startup Events ====================
+
+@app.on_event("startup")
+async def startup_event():
+    """Run on application startup"""
+    logger.info(f"API starting at {settings.API_V1_STR}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Run on application shutdown"""
+    logger.info("API shutdown")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG,
+        log_level="info",
+    )

@@ -1,123 +1,131 @@
-
-# ─── Networks ─────────────────────────────────────────────────────────────────
-networks:
-  portal-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
-
-# ─── Volumes ──────────────────────────────────────────────────────────────────
-volumes:
-  postgres_data:
-    driver: local
-  redis_data:
-    driver: local
-  pgadmin_data:
-    driver: local
+version: '3.9'
 
 services:
-
-  # ════════════════════════════════════════════════════
-  # PostgreSQL 16 — Primary Database
-  # ════════════════════════════════════════════════════
+  # PostgreSQL Database
   postgres:
     image: postgres:16-alpine
-    container_name: gcp-portal-postgres
-    restart: unless-stopped
-    networks:
-      - portal-network
+    container_name: gcp-portal-db
     environment:
-      POSTGRES_DB: gcp_portal
-      POSTGRES_USER: portal
-      POSTGRES_PASSWORD: portal123
-      POSTGRES_HOST_AUTH_METHOD: md5
-      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-gcp_portal}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U portal -d gcp_portal"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
-    command: >
-      postgres
-        -c max_connections=200
-        -c shared_buffers=256MB
-        -c effective_cache_size=768MB
-        -c log_statement=all
-        -c log_duration=on
+    networks:
+      - gcp-portal
 
-  # ════════════════════════════════════════════════════
-  # Redis 7 — Task Queue + WebSocket Broker + Cache
-  # ════════════════════════════════════════════════════
+  # Redis Cache
   redis:
     image: redis:7-alpine
     container_name: gcp-portal-redis
-    restart: unless-stopped
-    networks:
-      - portal-network
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gcp-portal
 
-  # ════════════════════════════════════════════════════
-  # pgAdmin 4 — Database Browser UI
-  # ════════════════════════════════════════════════════
+  # pgAdmin - Database Management
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: gcp-portal-pgadmin
-    restart: unless-stopped
-    networks:
-      - portal-network
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@portal.local
-      PGADMIN_DEFAULT_PASSWORD: admin123
-      PGADMIN_CONFIG_SERVER_MODE: "False"
-      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
     ports:
       - "5050:80"
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - gcp-portal
 
-  # ════════════════════════════════════════════════════
-  # MailHog — Local SMTP Server for Email Testing
-  # ════════════════════════════════════════════════════
+  # MailHog - Email Testing
   mailhog:
-    image: mailhog/mailhog:v1.0.1
+    image: mailhog/mailhog:latest
     container_name: gcp-portal-mailhog
-    restart: unless-stopped
-    networks:
-      - portal-network
     ports:
-      - "1025:1025"    # SMTP port
-      - "8025:8025"    # Web UI
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - gcp-portal
 
-  # ════════════════════════════════════════════════════
-  # RedisInsight — Redis Browser UI (optional)
-  # ════════════════════════════════════════════════════
-  redisinsight:
+  # Redis Insight - Redis Management
+  redis-insight:
     image: redislabs/redisinsight:latest
-    container_name: gcp-portal-redisinsight
-    restart: unless-stopped
-    networks:
-      - portal-network
+    container_name: gcp-portal-redis-insight
     ports:
-      - "5540:5540"
+      - "8001:8001"
+    networks:
+      - gcp-portal
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gcp-portal-backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_NAME:-gcp_portal}
+      DEBUG: "true"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-your-secret-key-change-in-production}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID}
+      GCP_CREDENTIALS_PATH: ${GCP_CREDENTIALS_PATH}
+      SMTP_SERVER: mailhog
+      SMTP_PORT: 1025
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ${GCP_CREDENTIALS_PATH}:${GCP_CREDENTIALS_PATH}:ro
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - gcp-portal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gcp-portal-frontend
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - gcp-portal
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  gcp-portal:
+    driver: bridge
